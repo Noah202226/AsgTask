@@ -1,9 +1,13 @@
 const { google } = require("googleapis");
 const readline = require("readline");
 const fs = require("fs");
+const path = require("path");
 
 const credentials = require("./credentials.json");
 const { client_secret, client_id, redirect_uris } = credentials.web;
+
+const TOKEN_PATH = path.join(__dirname, "token.json");
+
 const oAuth2Client = new google.auth.OAuth2(
   client_id,
   client_secret,
@@ -12,68 +16,106 @@ const oAuth2Client = new google.auth.OAuth2(
 
 const SCOPES = ["https://www.googleapis.com/auth/drive"];
 
-// === 1. Generate Auth URL ===
-const authUrl = oAuth2Client.generateAuthUrl({
-  access_type: "offline",
-  scope: SCOPES,
-  prompt: "consent", // Force new permissions
-});
-
-console.log("🔗 Open this URL in your browser:\n", authUrl);
-
-// === 2. Ask for Auth Code ===
-const rl = readline.createInterface({
-  input: process.stdin,
-  output: process.stdout,
-});
-
-rl.question("\nPaste the code here: ", (code) => {
-  rl.close();
-  oAuth2Client.getToken(code, async (err, token) => {
-    if (err) return console.error("❌ Error retrieving access token", err);
-    oAuth2Client.setCredentials(token);
-    fs.writeFileSync("token.json", JSON.stringify(token));
-    console.log("✅ Token saved\n");
-
-    // === 3. Transfer File Ownership ===
-    const drive = google.drive({ version: "v3", auth: oAuth2Client });
-
-    const FILE_ID = "1rmhR8xBeMvp9-oUB63Nx48TYdZWfwFOX"; // 📝 Change this
-    const NEW_OWNER_EMAIL = "noaligpitan2@gmail.com"; // 📝 Change this
-
-    try {
-      // Step 1: Share as writer
-      const res = await drive.permissions.create({
-        fileId: FILE_ID,
-        requestBody: {
-          type: "user",
-          role: "writer",
-          emailAddress: NEW_OWNER_EMAIL,
-        },
-        fields: "id",
-      });
-
-      const permissionId = res.data.id;
-      console.log(
-        `✅ Shared with ${NEW_OWNER_EMAIL}, permission ID: ${permissionId}`
-      );
-
-      // Step 2: Promote to owner
-      await drive.permissions.update({
-        fileId: FILE_ID,
-        permissionId,
-        transferOwnership: true,
-        requestBody: {
-          role: "owner",
-        },
-      });
-
-      console.log(`✅ Ownership transferred to ${NEW_OWNER_EMAIL}`);
-    } catch (error) {
-      console.error(
-        "❌ Failed to transfer ownership:",
-        error.errors || error.message
-      );
-    }
+function getAccessToken(callback) {
+  const authUrl = oAuth2Client.generateAuthUrl({
+    access_type: "offline",
+    scope: SCOPES,
+    prompt: "consent",
   });
-});
+
+  console.log("\n🔗 Open this URL in your browser:\n", authUrl);
+
+  const rl = readline.createInterface({
+    input: process.stdin,
+    output: process.stdout,
+  });
+
+  rl.question("\n📥 Paste the code here: ", (code) => {
+    rl.close();
+    oAuth2Client.getToken(code, (err, token) => {
+      if (err) return console.error("❌ Error retrieving access token", err);
+      oAuth2Client.setCredentials(token);
+      fs.writeFileSync(TOKEN_PATH, JSON.stringify(token));
+      console.log("✅ Token saved\n");
+      callback(oAuth2Client);
+    });
+  });
+}
+
+function authorize(callback) {
+  if (fs.existsSync(TOKEN_PATH)) {
+    const token = JSON.parse(fs.readFileSync(TOKEN_PATH));
+    oAuth2Client.setCredentials(token);
+    callback(oAuth2Client);
+  } else {
+    getAccessToken(callback);
+  }
+}
+
+function transferOwnership(auth) {
+  const drive = google.drive({ version: "v3", auth });
+
+  const FILE_ID = "1FE7zAxyvGCU8Ac5l9OiWia08MdfviiCR32AChAlXRwM";
+  const NEW_OWNER_EMAIL = "noaligpitan26@gmail.com";
+
+  drive.permissions.list(
+    {
+      fileId: FILE_ID,
+      fields: "permissions(id,emailAddress,role)",
+    },
+    async (err, res) => {
+      if (err) return console.error("❌ Error fetching permissions:", err);
+      const permission = res.data.permissions.find(
+        (perm) => perm.emailAddress === NEW_OWNER_EMAIL
+      );
+
+      let permissionId = permission?.id;
+
+      if (!permission) {
+        // First share the file as a writer
+        const createRes = await drive.permissions.create({
+          fileId: FILE_ID,
+          requestBody: {
+            type: "user",
+            role: "writer",
+            emailAddress: NEW_OWNER_EMAIL,
+          },
+          fields: "id",
+        });
+
+        permissionId = createRes.data.id;
+
+        console.log(`✅ Shared as writer. Permission ID: ${permissionId}`);
+        console.log(
+          `⚠️ Ask ${NEW_OWNER_EMAIL} to accept the file in their Google Drive.`
+        );
+        return;
+      }
+
+      console.log(
+        `✅ User already has writer access. Permission ID: ${permissionId}`
+      );
+
+      // Now try to initiate ownership transfer
+      try {
+        await drive.permissions.update({
+          fileId: FILE_ID,
+          permissionId,
+          requestBody: {
+            role: "owner", // ONLY role
+          },
+          transferOwnership: true, // TOP-LEVEL parameter
+        });
+
+        console.log(`✅ Ownership transfer initiated to ${NEW_OWNER_EMAIL}.`);
+        console.log(
+          `📌 The user must now accept the ownership to complete it.`
+        );
+      } catch (error) {
+        console.error("❌ Transfer failed:", error.errors || error.message);
+      }
+    }
+  );
+}
+
+authorize(transferOwnership);
